@@ -5,6 +5,7 @@ local clnumber = require 'cl.obj.number'
 require 'symmath'.setup()
 
 local x, y = vars('x', 'y')
+local coords = table{x, y}
 local u = var'u'
 local alpha = var'alpha'
 
@@ -15,12 +16,14 @@ local vars = table()
 local SingleLine = require 'symmath.tostring.SingleLine'
 
 -- because :map is bottom up, I need to collect diffs and remove them first
+local diffvars = table()
 pde = pde:map(function(expr)
 	if symmath.diff.is(expr) then
 		local name = table.map(expr, function(v) return v.name end):concat'_'
 		local v = vars[name]
 		if not v then
 			v = var(name)
+			diffvars:insert{[name]=expr}
 			vars[name] = v
 		end
 		return v
@@ -49,13 +52,8 @@ constant const real2 dx = (real2)(
 	<?=clnumber((xmax[1] - xmin[1]) / tonumber(env.base.size.x))?>,
 	<?=clnumber((xmax[2] - xmin[2]) / tonumber(env.base.size.y))?>);
 #define cell_x(i) (xmin + ((real2)(i.x, i.y) + (real2)(.5, .5)) * dx)
-
-//boundary conditions
-#define boundaryXP(i) 0.
-#define boundaryXM(i) 0.
-#define boundaryYP(i) 0.
-#define boundaryYM(i) 0.
-
+#define OOB(i)	(i.x < 0 || i.y < 0 || i.x >= size.x || i.y >= size.y)
+#define boundary(i)	0.
 inline real calc_u<?=uCode?>
 
 ]], {
@@ -82,6 +80,70 @@ env:kernel{
 ]]
 }()
 
+-- now take the derivative variables and collect the source variables required for the finite derivative kernel
+local matrix = require 'matrix'
+local function suffixForOffset(v) return table.concat(v, '_'):gsub('-','m') end
+local offsets = table()
+if vars:find(u) then offsets:insert(matrix{0,0}) end
+local lines = table()
+for _,kv in ipairs(diffvars) do
+	local name, v = next(kv)
+	-- count the # of unique variables
+	local ds = matrix{0,0}
+	for i=2,#v do
+		local j = assert(coords:find(v[i]))
+		ds[j] = ds[j] + 1
+	end
+	local numNonZero = 0
+	local side
+	for i=1,#ds do
+		if ds[i] ~= 0 then 
+			numNonZero = numNonZero + 1 
+			side = i
+		end
+	end
+
+	local function ofs(i)
+		local xp = matrix{2}:zeros() 
+		xp[side] = i
+		if not offsets:find(xp) then offsets:insert(xp) end
+		xp = suffixForOffset(xp)
+		return 'u_'..xp
+	end
+
+	if numNonZero == 1 then
+		-- numerical derivatives along a single axis
+		local count = ds[side]
+
+		local args = {name = name, ofs = ofs, side = side}
+		if count == 1 then
+			lines:insert(template([[	real <?=name?> = (<?=ofs(1)?> - <?=ofs(-1)?>) / (2. * dx.s<?=side-1?>);]], args))
+		elseif count == 2 then
+			lines:insert(template([[	real <?=name?> = (<?=ofs(1)?> - 2. * <?=ofs(0)?> + <?=ofs(-1)?>) / (dx.s<?=side-1?> * dx.s<?=side-1?>);]], args))
+		else
+			error("haven't got this derivative order yet?")
+		end
+	else
+		error("haven't got support for mixed derivatives just yet")
+	end
+end
+
+local ofslines = table()
+for _,offset in ipairs(offsets) do
+	ofslines:insert(template([[
+	int4 i_<?=suffix?> = i;
+	i_<?=suffix?>.x += <?=offset[1]?>;
+	i_<?=suffix?>.y += <?=offset[2]?>;
+	real u_<?=suffix?> = OOB(i_<?=suffix?>) ? boundary(i_<?=suffix?>) : u[indexForInt4(i_<?=suffix?>)];
+]], 	{
+			offset = offset,
+			suffix = suffixForOffset(offset),
+		}))
+end
+lines = ofslines:append(lines)
+
+lines = lines:concat'\n'
+
 -- solve u,xx + u.yy = rho
 local gmres = require 'solver.cl.gmres'{
 	env = env,
@@ -90,28 +152,12 @@ local gmres = require 'solver.cl.gmres'{
 		argsIn = {{name='u', type='real', obj=true}},
 		body = template([[
 	const real alpha = <?=clnumber(alpha)?>;	
-	
-	real ui = u[index];
-	int4 ixp = i;
-	ixp.x++;
-	real uxp = i.x < size.x-1 ? u[indexForInt4(ixp)] : boundaryXP(i);
-	int4 ixm = i;
-	ixm.x--;
-	real uxm = i.x > 0 ? u[indexForInt4(ixm)] : boundaryXM(i);
-	int4 iyp = i;
-	iyp.y++;
-	real uyp = i.y < size.y-1 ? u[indexForInt4(iyp)] : boundaryYP(i);
-	int4 iym = i;
-	iym.y--;
-	real uym = i.y > 0 ? u[indexForInt4(iym)] : boundaryYM(i);
-
-	const real u_x_x = (uxp - 2 * ui + uxm) / (dx.x * dx.x);
-	const real u_y_y = (uyp - 2 * ui + uym) / (dx.y * dx.y);
-	
+<?=lines?>
 	Au[index] = calc_u(<?=vars:map(function(kv) return (next(kv)) end):concat', '?>);
 ]],		{
 			vars = vars,
 			clnumber = clnumber,
+			lines = lines,
 			alpha = .01,
 		}),
 	},
