@@ -1,28 +1,39 @@
 #!/usr/bin/env luajit
 require 'ext'
 local template = require 'template'
+local symmath = require 'symmath'
+local gnuplot = require 'gnuplot'
+local matrix = require 'matrix'
+local CLEnv = require 'cl.obj.env'
+local CLGMRES = require 'solver.cl.gmres'
 local clnumber = require 'cl.obj.number'
-require 'symmath'.setup()
 
-local x, y = vars('x', 'y')
+local derivativeOrder = 2
+
+local x, y = symmath.vars('x', 'y')
+
+local u = symmath.var'u'
+
+local alpha = symmath.var'alpha'
+alpha.value = 10
+
 local coords = table{x, y}
-local u = var'u'
-local alpha = var'alpha'
+
+local params = table{alpha}
 
 local pde = alpha * (u:diff(x,x) + u:diff(y,y))
 
-local vars = table()
 
-local SingleLine = require 'symmath.tostring.SingleLine'
 
 -- because :map is bottom up, I need to collect diffs and remove them first
+local vars = table()
 local diffvars = table()
 pde = pde:map(function(expr)
 	if symmath.diff.is(expr) then
 		local name = table.map(expr, function(v) return v.name end):concat'_'
 		local v = vars[name]
 		if not v then
-			v = var(name)
+			v = symmath.var(name)
 			diffvars:insert{[name]=expr}
 			vars[name] = v
 		end
@@ -33,12 +44,10 @@ end):map(function(expr)
 		vars[expr.name] = expr
 	end
 end)
-
 vars = vars:kvpairs()
-
 local uCode = pde:compile(vars, 'C')
 
-local env = require 'cl.obj.env'{size={256,256}}
+local env = CLEnv{size={256,256}}
 
 local volume = tonumber(env.base.volume)
 
@@ -76,12 +85,49 @@ env:kernel{
 	argsOut={rhoBuf},
 	body=[[
 	real2 x = cell_x(i);
-	rho[index] = dot(x,x) < .5*.5 ? .1 : 0.;
+	rho[index] = dot(x,x) < .5 *.5 ? .1 : 0.;
 ]]
 }()
 
+-- derivCoeffs[derivative][accuracy] = {coeffs...}
+local derivCoeffs = {
+	-- antisymmetric coefficients 
+	{
+		[2] = {.5},
+		[4] = {2/3, -1/12},
+		[6] = {3/4, -3/20, 1/60},
+		[8] = {4/5, -1/5, 4/105, -1/280},
+	},
+	-- symmetric
+	{
+		[2] = {[0] = -2, 1},
+		[4] = {[0] = -5/2, 4/3, -1/12},
+		[6] = {[0] = -49/18, 3/2, -3/20, 1/90},
+		[8] = {[0] = -205/72, 8/5, -1/5, 8/315, -1/560},
+	},
+	-- antisymmetric 
+	{
+		[2] = {-1, 1/2},
+		[4] = {-13/8, 1, -1/8},
+		[6] = {-61/30, 169/120, -3/10, 7/240},
+	},
+	-- symmetric
+	{
+		[2] = {[0] = 6, -4, 1},
+		[4] = {[0] = 28/3, -13/2, 2, -1/6},
+		[6] = {[0] = 91/8, -122/15, 169/60, -2/5, 7/240},
+	},
+	-- antisymmetric 
+	{
+		[2] = {5/2, -2, 1/2},
+	},
+	-- symmetric
+	{
+		[2] = {[0] = -20, 15, -6, 1},
+	},
+}
+
 -- now take the derivative variables and collect the source variables required for the finite derivative kernel
-local matrix = require 'matrix'
 local function suffixForOffset(v) return table.concat(v, '_'):gsub('-','m') end
 local offsets = table()
 if vars:find(u) then offsets:insert(matrix{0,0}) end
@@ -103,24 +149,34 @@ for _,kv in ipairs(diffvars) do
 		end
 	end
 
-	local function ofs(i)
-		local xp = matrix{2}:zeros() 
-		xp[side] = i
-		if not offsets:find(xp) then offsets:insert(xp) end
-		xp = suffixForOffset(xp)
-		return 'u_'..xp
-	end
-
 	if numNonZero == 1 then
+		local function ofs(i)
+			local xp = matrix{2}:zeros() 
+			xp[side] = i
+			if not offsets:find(xp) then offsets:insert(xp) end
+			xp = suffixForOffset(xp)
+			return 'u_'..xp
+		end
+		
 		-- numerical derivatives along a single axis
 		local count = ds[side]
+		local coeffs = derivCoeffs[count][derivativeOrder]
 
-		local args = {name = name, ofs = ofs, side = side}
-		if count == 1 then
-			lines:insert(template([[	real <?=name?> = (<?=ofs(1)?> - <?=ofs(-1)?>) / (2. * dx.s<?=side-1?>);]], args))
+		local args = {
+			name = name,
+			ofs = ofs,
+			side = side,
+			num = range(-#coeffs,#coeffs):map(function(i) 
+				local coeff = coeffs[math.abs(i)]
+				return coeff and (clnumber(coeff)..' * '..ofs(i)) or '0.'
+			end):concat' + ',
+			dx = range(count):map(function() 
+				return 'dx.s'..(side-1) 
+			end):concat' * ',
+		}
+		if coeffs then
+			lines:insert(template([[	real <?=name?> = (<?=num?>) / (<?=dx?>);]], args))
 		elseif count == 2 then
-			lines:insert(template([[	real <?=name?> = (<?=ofs(1)?> - 2. * <?=ofs(0)?> + <?=ofs(-1)?>) / (dx.s<?=side-1?> * dx.s<?=side-1?>);]], args))
-		else
 			error("haven't got this derivative order yet?")
 		end
 	else
@@ -142,16 +198,26 @@ for _,offset in ipairs(offsets) do
 end
 lines = ofslines:append(lines)
 
+local paramlines = table()
+for _,param in ipairs(params) do
+	local name = param.name
+	local value = param.value
+	paramlines:insert(template([[	const real <?=name?> = <?=clnumber(value)?>;]], {
+		clnumber = clnumber,
+		name = name,
+		value = value,
+	}))
+end
+lines = paramlines:append(lines)
+
 lines = lines:concat'\n'
 
--- solve u,xx + u.yy = rho
-local gmres = require 'solver.cl.gmres'{
+local gmres = CLGMRES{
 	env = env,
 	A = env:kernel{
 		argsOut = {{name='Au', type='real', obj=true}},
 		argsIn = {{name='u', type='real', obj=true}},
 		body = template([[
-	const real alpha = <?=clnumber(alpha)?>;	
 <?=lines?>
 	Au[index] = calc_u(<?=vars:map(function(kv) return (next(kv)) end):concat', '?>);
 ]],		{
@@ -191,7 +257,6 @@ end
 local xs = range(tonumber(env.base.size.x)):map(function(i) return (i-.5)*(xmax[1]-xmin[1])/tonumber(env.base.size.x) + xmin[1] end)
 local ys = range(tonumber(env.base.size.y)):map(function(i) return (i-.5)*(xmax[2]-xmin[2])/tonumber(env.base.size.y) + xmin[2] end)
 
-local gnuplot = require 'gnuplot'
 for _,info in ipairs{
 	{u=uBuf}, 
 	--{u0=u0Buf},
