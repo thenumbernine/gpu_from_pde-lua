@@ -6,15 +6,38 @@ require 'symmath'.setup()
 
 local x, y = vars('x', 'y')
 local u = var'u'
-local u_xx = var'u_xx'
-local u_yy = var'u_yy'
 local alpha = var'alpha'
 
-local pde = alpha * (u_xx + u_yy)
+local pde = alpha * (u:diff(x,x) + u:diff(y,y))
 
-local f = pde:compile({u, x, y, u_xx, u_yy, alpha}, 'C')
+local vars = table()
+
+local SingleLine = require 'symmath.tostring.SingleLine'
+
+-- because :map is bottom up, I need to collect diffs and remove them first
+pde = pde:map(function(expr)
+	if symmath.diff.is(expr) then
+		local name = table.map(expr, function(v) return v.name end):concat'_'
+		local v = vars[name]
+		if not v then
+			v = var(name)
+			vars[name] = v
+		end
+		return v
+	end
+end):map(function(expr)
+	if symmath.var.is(expr) then
+		vars[expr.name] = expr
+	end
+end)
+
+vars = vars:kvpairs()
+
+local uCode = pde:compile(vars, 'C')
 
 local env = require 'cl.obj.env'{size={256,256}}
+
+local volume = tonumber(env.base.volume)
 
 local xmin = {-1, -1}
 local xmax = {1, 1}
@@ -32,11 +55,15 @@ constant const real2 dx = (real2)(
 #define boundaryXM(i) 0.
 #define boundaryYP(i) 0.
 #define boundaryYM(i) 0.
+
+inline real calc_u<?=uCode?>
+
 ]], {
 	env = env,
 	xmin = xmin,
 	xmax = xmax,
 	clnumber = clnumber,
+	uCode = uCode,
 })
 
 -- initialize u
@@ -56,7 +83,7 @@ env:kernel{
 }()
 
 -- solve u,xx + u.yy = rho
-require 'solver.cl.gmres'{
+local gmres = require 'solver.cl.gmres'{
 	env = env,
 	A = env:kernel{
 		argsOut = {{name='Au', type='real', obj=true}},
@@ -78,24 +105,30 @@ require 'solver.cl.gmres'{
 	iym.y--;
 	real uym = i.y > 0 ? u[indexForInt4(iym)] : boundaryYM(i);
 
-	const real u_xx = (uxp - 2 * ui + uxm) / (dx.x * dx.x);
-	const real u_yy = (uyp - 2 * ui + uym) / (dx.y * dx.y);
+	const real u_x_x = (uxp - 2 * ui + uxm) / (dx.x * dx.x);
+	const real u_y_y = (uyp - 2 * ui + uym) / (dx.y * dx.y);
 	
-	Au[index] = alpha * (u_xx + u_yy);
+	Au[index] = calc_u(<?=vars:map(function(kv) return (next(kv)) end):concat', '?>);
 ]],		{
+			vars = vars,
 			clnumber = clnumber,
 			alpha = .01,
 		}),
 	},
 	b = rhoBuf,
 	x = uBuf,
-	epsilon = 1,
+	epsilon = .01,
 	restart = 30,
 	errorCallback = function(err,iter)
 		io.stderr:write(tostring(err)..'\t'..tostring(iter)..'\n')
 		assert(err == err)
 	end,
-}()
+}
+local olddot = gmres.args.dot
+gmres.args.dot = function(...)
+	return olddot(...) / volume
+end
+gmres()
 
 local function gpuToTable(x)
 	local cpu = x:toCPU()
