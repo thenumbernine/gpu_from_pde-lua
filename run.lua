@@ -11,19 +11,23 @@ local clnumber = require 'cl.obj.number'
 local derivativeOrder = 2
 
 local x, y = symmath.vars('x', 'y')
-
-local u = symmath.var'u'
-
-local alpha = symmath.var'alpha'
-alpha.value = 10
-
 local coords = table{x, y}
+symmath.Tensor.coords{
+	{variables=coords},
+	{symbols='x', variables={x}},
+	{symbols='y', variables={y}},
+}
+
+local u = symmath.var('u', {x, y})
+
+local alpha = symmath.var('alpha', nil, 10)
 
 local params = table{alpha}
 
-local pde = alpha * (u:diff(x,x) + u:diff(y,y))
+local pde = alpha * (u',xx' + u',yy')
 
-
+pde = pde()
+print(pde)
 
 -- because :map is bottom up, I need to collect diffs and remove them first
 local vars = table()
