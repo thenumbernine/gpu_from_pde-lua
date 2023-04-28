@@ -33,7 +33,7 @@ print(pde)
 local vars = table()
 local diffvars = table()
 pde = pde:map(function(expr)
-	if symmath.diff.is(expr) then
+	if symmath.diff:isa(expr) then
 		local name = table.map(expr, function(v) return v.name end):concat'_'
 		local v = vars[name]
 		if not v then
@@ -44,7 +44,7 @@ pde = pde:map(function(expr)
 		return v
 	end
 end):map(function(expr)
-	if symmath.var.is(expr) then
+	if symmath.var:isa(expr) then
 		vars[expr.name] = expr
 	end
 end)
